@@ -1,19 +1,27 @@
+use crate::{Settings, ItemIter};
+
 
 /// Per-line input stream for [`FromInput`] implementations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Input<'a> {
+    settings: &'a Settings,
     content: &'a str,
     offset: usize,
 }
 
 impl<'a> Input<'a> {
-    pub(crate) fn new(content: &'a str, offset: usize) -> Self {
-        Self { content, offset }
+    pub(crate) fn new(settings: &'a Settings, content: &'a str, offset: usize) -> Self {
+        Self { settings, content, offset }
     }
 
     /// The rest of the available content (includes trailing comments and whitespaces).
     pub fn content(&self) -> &'a str {
         self.content
+    }
+
+    /// The [`Settings`] used to parse this input.
+    pub fn settings(&self) -> &'a Settings {
+        &self.settings
     }
 
     pub(crate) fn offset(&self) -> usize {
@@ -28,6 +36,7 @@ impl<'a> Input<'a> {
     pub fn trim(&self) -> Self {
         let content = self.content.trim_start();
         Self {
+            settings: self.settings,
             content,
             offset: self.offset + (self.content.len() - content.len()),
         }
@@ -36,6 +45,7 @@ impl<'a> Input<'a> {
     /// Skip a number of bytes of content.
     pub fn skip(&self, bytes: usize) -> Self {
         Self {
+            settings: self.settings,
             content: &self.content[bytes..],
             offset: self.offset + bytes,
         }
@@ -52,9 +62,19 @@ impl<'a> Input<'a> {
             return None;
         }
         Some((&self.content[..len], Self {
+            settings: self.settings,
             content: &self.content[len..],
             offset: self.offset + len,
         }))
+    }
+
+    /// Produce a parrsing [`ItemIter`] for this input.
+    pub fn iter<T, F>(&self, until: F) -> ItemIter<'_, T, F>
+    where
+        T: FromInput,
+        F: FnMut(Self) -> bool,
+    {
+        ItemIter::new(*self, until)
     }
 }
 
