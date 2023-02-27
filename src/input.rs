@@ -96,7 +96,7 @@ impl<'a> Input<'a> {
                 },
             };
 
-            if input.len() == rest_input.len() {
+            if input.content().len() == rest_input.content().len() {
                 let item_type = std::any::type_name::<T>();
                 let rest_content = input.content();
                 panic!("item parser `{item_type}` did not consume any input from `{rest_content}`");
@@ -107,14 +107,6 @@ impl<'a> Input<'a> {
         }
 
         Ok((items, input))
-    }
-}
-
-impl std::ops::Deref for Input<'_> {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        self.content
     }
 }
 
