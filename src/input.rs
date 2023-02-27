@@ -1,4 +1,4 @@
-use crate::{Settings, ItemIter};
+use crate::{Settings, ErrorKind};
 
 
 /// Per-line input stream for [`FromInput`] implementations.
@@ -68,13 +68,45 @@ impl<'a> Input<'a> {
         }))
     }
 
-    /// Produce a parrsing [`ItemIter`] for this input.
-    pub fn iter<T, F>(&self, until: F) -> ItemIter<'_, T, F>
+    /// Parse until an end-condition is reached.
+    pub fn parse_until<T, F>(&self, mut until: F) -> Result<(Vec<T>, Self), ErrorKind<T::Err>>
     where
         T: FromInput,
         F: FnMut(Self) -> bool,
     {
-        ItemIter::new(*self, until)
+        let mut items = Vec::new();
+        let mut input = *self;
+
+        'items: loop {
+            input = input.trim();
+            if input.is_empty()
+                || self.settings().is_skipped_line(input.content())
+                || until(input)
+            {
+                break 'items;
+            }
+
+            let (item, rest_input) = match T::from_input(input) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return Err(ErrorKind::Item {
+                        error,
+                        offset: input.offset(),
+                    });
+                },
+            };
+
+            if input.len() == rest_input.len() {
+                let item_type = std::any::type_name::<T>();
+                let rest_content = input.content();
+                panic!("item parser `{item_type}` did not consume any input from `{rest_content}`");
+            }
+
+            input = rest_input;
+            items.push(item);
+        }
+
+        Ok((items, input))
     }
 }
 
