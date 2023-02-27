@@ -65,6 +65,15 @@ where
             _item: PhantomData,
         }
     }
+
+    /// Collect all items and return them with the rest [`Input`].
+    pub fn collect_with_input<O>(mut self) -> Result<(O, Input<'a>), ErrorKind<T::Err>>
+    where
+        O: FromIterator<T>,
+    {
+        let collected = (&mut self).collect::<Result<O, _>>()?;
+        Ok((collected, self.input))
+    }
 }
 
 impl<'a, T, F> Iterator for ItemIter<'a, T, F>
