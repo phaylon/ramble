@@ -1,4 +1,4 @@
-use crate::{Settings, ErrorKind};
+use crate::{Settings, ErrorKind, Error};
 
 
 /// Per-line input stream for [`FromInput`] implementations.
@@ -7,11 +7,21 @@ pub struct Input<'a> {
     settings: &'a Settings,
     content: &'a str,
     offset: usize,
+    line_index: usize,
 }
 
 impl<'a> Input<'a> {
-    pub(crate) fn new(settings: &'a Settings, content: &'a str, offset: usize) -> Self {
-        Self { settings, content, offset }
+    pub(crate) fn new(
+        settings: &'a Settings,
+        content: &'a str,
+        line_index: usize,
+        offset: usize,
+    ) -> Self {
+        Self { settings, content, line_index, offset }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.content.is_empty()
     }
 
     /// The rest of the available content (includes trailing comments and whitespaces).
@@ -19,35 +29,43 @@ impl<'a> Input<'a> {
         self.content
     }
 
+    /// The index of the line the input is representing.
+    pub fn line_index(&self) -> usize {
+        self.line_index
+    }
+
     /// The [`Settings`] used to parse this input.
     pub fn settings(&self) -> &'a Settings {
         &self.settings
     }
 
-    pub(crate) fn offset(&self) -> usize {
-        self.offset
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.content.is_empty()
+    /// Construct an [`Error`] at the current input location.
+    pub fn error<E>(&self, item_error: E) -> Error<E> {
+        Error {
+            line_index: self.line_index,
+            kind: ErrorKind::Item {
+                error: item_error,
+                offset: self.offset,
+            },
+        }
     }
 
     /// Trim leading whitespace.
     pub fn trim(&self) -> Self {
         let content = self.content.trim_start();
         Self {
-            settings: self.settings,
             content,
             offset: self.offset + (self.content.len() - content.len()),
+            .. *self
         }
     }
 
     /// Skip a number of bytes of content.
     pub fn skip(&self, bytes: usize) -> Self {
         Self {
-            settings: self.settings,
             content: &self.content[bytes..],
             offset: self.offset + bytes,
+            .. *self
         }
     }
 
@@ -62,14 +80,14 @@ impl<'a> Input<'a> {
             return None;
         }
         Some((&self.content[..len], Self {
-            settings: self.settings,
             content: &self.content[len..],
             offset: self.offset + len,
+            .. *self
         }))
     }
 
     /// Parse until an end-condition is reached.
-    pub fn parse_until<T, F>(&self, mut until: F) -> Result<(Vec<T>, Self), ErrorKind<T::Err>>
+    pub fn parse_until<T, F>(&self, mut until: F) -> Result<(Vec<T>, Self), Error<T::Err>>
     where
         T: FromInput,
         F: FnMut(Self) -> bool,
@@ -89,10 +107,7 @@ impl<'a> Input<'a> {
             let (item, rest_input) = match T::from_input(input) {
                 Ok(parsed) => parsed,
                 Err(error) => {
-                    return Err(ErrorKind::Item {
-                        error,
-                        offset: input.offset(),
-                    });
+                    return Err(input.error(error));
                 },
             };
 

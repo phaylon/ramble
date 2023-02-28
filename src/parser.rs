@@ -18,9 +18,8 @@ where
         };
 
         let items = {
-            let input = Input::new(settings, line, settings.indentation_len(depth));
-            let items = parse_input(input)
-                .map_err(|kind| kind.into_error(line_index))?;
+            let input = Input::new(settings, line, line_index, settings.indentation_len(depth));
+            let items = parse_input(input)?;
             if settings.is_skipped_node(line) {
                 StackItem::Skip
             } else {
@@ -35,7 +34,7 @@ where
     Ok(stack.into_tree())
 }
 
-fn parse_input<A>(input: Input<'_>) -> Result<Vec<A>, ErrorKind<A::Err>>
+fn parse_input<A>(input: Input<'_>) -> Result<Vec<A>, Error<A::Err>>
 where
     A: FromInput,
 {
