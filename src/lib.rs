@@ -27,6 +27,10 @@ impl<A> Tree<A> {
     pub fn children_mut(&mut self) -> &mut Vec<Node<A>> {
         &mut self.children
     }
+
+    pub fn into_children(self) -> Vec<Node<A>> {
+        self.children
+    }
 }
 
 impl<A> Default for Tree<A> {
@@ -69,6 +73,14 @@ impl<A> Node<A> {
 
     pub fn items_mut(&mut self) -> &mut Vec<A> {
         &mut self.items
+    }
+
+    pub fn into_items(self) -> Vec<A> {
+        self.items
+    }
+
+    pub fn into_parts(self) -> (Vec<A>, Vec<Node<A>>) {
+        (self.items, self.subtree.into_children())
     }
 }
 
