@@ -1,162 +1,357 @@
-use crate::{Settings, Tree, FromInput, Input, Node};
+use std::num::{ParseIntError, ParseFloatError};
+
+use crate::{Tree, NodeLocation, Span, Item, ItemKind, GroupKind, Num, Node};
 
 
-/// Parse a string slice into a [`Tree`](crate::Tree).
-pub fn parse<A>(input: &str, settings: &Settings) -> Result<Tree<A>, Error<A::Err>>
-where
-    A: FromInput,
-{
-    let mut stack: Stack<A> = Stack::new();
+const INDENT: &str = "  ";
+const COMMENT: char = ';';
+const PUNCT: [char; 3] = [':', '!', '?'];
 
-    'lines: for (line_index, line) in input.lines().enumerate() {
-        if settings.is_skipped_line(line) {
+const GROUP_LEN: usize = 3;
+const GROUP_BEGIN: [char; GROUP_LEN] = ['(', '[', '{'];
+const GROUP_END: [char; GROUP_LEN] = [')', ']', '}'];
+const GROUP_KIND: [GroupKind; GROUP_LEN] = [
+    GroupKind::Parentheses,
+    GroupKind::Brackets,
+    GroupKind::Braces,
+];
+
+const NON_TERM: &[&[char]] = &[
+    &[COMMENT],
+    &PUNCT,
+    &GROUP_BEGIN,
+    &GROUP_END,
+];
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub location: NodeLocation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseErrorKind {
+    Item {
+        kind: ParseItemErrorKind,
+        span: Span,
+    },
+    InvalidIndentation,
+    InvalidIndentationDepth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseItemErrorKind {
+    Unexpected(char),
+    InvalidInt(ParseIntError),
+    InvalidFloat(ParseFloatError),
+    MissingGroupClose(char),
+    UnexpectedGroupClose(char),
+    GroupCloseMismatch(char, Span),
+}
+
+pub(crate) fn parse_str(content: &str) -> Result<Tree, ParseError> {
+    let mut stack = TreeStack::default();
+    'lines: for (line, location) in LineIter::new(content) {
+        if is_skipped_line(line) {
             continue 'lines;
         }
-
-        let Some((depth, line)) = settings.determine_line_indentation(line) else {
-            return Err(ErrorKind::IndentationInvalid.into_error(line_index));
+        let (depth, line) = destruct_line(line, &location)?;
+        let items = parse_line(line)?;
+        let node = Node {
+            items,
+            location,
+            subtree: Tree::default(),
         };
-
-        let items = {
-            let input = Input::new(settings, line, line_index, settings.indentation_len(depth));
-            let items = parse_input(input)?;
-            if settings.is_skipped_node(line) {
-                StackItem::Skip
-            } else {
-                StackItem::Node(items)
-            }
-        };
-
-        stack.insert_node(depth, items)
-            .map_err(|kind| kind.into_error(line_index))?;
+        stack.insert_at_depth(depth, node)?;
     }
-
     Ok(stack.into_tree())
 }
 
-fn parse_input<A>(input: Input<'_>) -> Result<Vec<A>, Error<A::Err>>
-where
-    A: FromInput,
-{
-    let (items, _) = input.parse_until(|_input| false)?;
-    Ok(items)
+fn parse_line(line: Line<'_>) -> Result<Vec<Item>, ParseError> {
+    parse_items(line, None).map(|(items, _)| items)
 }
 
-struct Stack<A> {
-    root: Tree<A>,
-    node_stack: Vec<StackItem<Node<A>>>,
+fn parse_items<'a>(
+    line: Line<'a>,
+    group: Option<&GroupContext>,
+) -> Result<(Vec<Item>, Line<'a>), ParseError> {
+    let mut items = Vec::new();
+    let mut line = line.trim();
+    while !line.is_empty() {
+        if let Some(rest_line) = try_parse_group_end(line, group)? {
+            return Ok((items, rest_line));
+        }
+        let (item, rest_line) = parse_item(line)?;
+        line = rest_line.trim();
+        items.push(item);
+    }
+    if let Some(group) = group {
+        Err(line.item_error(
+            group.begin_span,
+            ParseItemErrorKind::MissingGroupClose(group.end_marker),
+        ))
+    } else {
+        Ok((items, line))
+    }
 }
 
-impl<T> Stack<T> {
-    fn new() -> Self {
-        Self {
-            root: Tree::default(),
-            node_stack: Vec::new(),
+fn try_parse_group_end<'a>(
+    line: Line<'a>,
+    group: Option<&GroupContext>,
+) -> Result<Option<Line<'a>>, ParseError> {
+    if let Some((c, span, rest_line, _)) = line.try_take_any_char(&GROUP_END) {
+        if let Some(group) = group {
+            if group.end_marker == c {
+                Ok(Some(rest_line))
+            } else {
+                Err(line.item_error(
+                    span,
+                    ParseItemErrorKind::GroupCloseMismatch(c, group.begin_span),
+                ))
+            }
+        } else {
+            Err(line.item_error(
+                span,
+                ParseItemErrorKind::UnexpectedGroupClose(c),
+            ))
         }
+    } else {
+        Ok(None)
     }
+}
 
-    fn into_tree(mut self) -> Tree<T> {
-        self.propagate_from_depth(0);
-        self.root
-    }
-
-    fn is_occupied_depth(&self, depth: usize) -> bool {
-        self.node_stack.len() > depth
-    }
-
-    fn insert_node<E>(
-        &mut self,
-        depth: usize,
-        node_items: StackItem<Vec<T>>,
-    ) -> Result<(), ErrorKind<E>> {
-        if depth > 0 && !self.is_occupied_depth(depth - 1) {
-            return Err(ErrorKind::IndentationTooDeep);
-        }
-        self.propagate_from_depth(depth);
-        let node = match self.node_stack.last() {
-            None | Some(StackItem::Node(_)) => node_items.map(|items| Node::with_items(items)),
-            Some(StackItem::Skip) => StackItem::Skip,
+fn parse_item<'a>(line: Line<'a>) -> Result<(Item, Line<'a>), ParseError> {
+    if let Some((c, span, rest_line, _)) = line.try_take_any_char(&PUNCT) {
+        let item = Item {
+            kind: ItemKind::Punctuation(c),
+            inline_span: span,
         };
-        self.node_stack.push(node);
-        Ok(())
+        Ok((item, rest_line))
+    } else if let Some((_, span, rest_line, index)) = line.try_take_any_char(&GROUP_BEGIN) {
+        let group = GroupContext {
+            end_marker: GROUP_END[index],
+            begin_span: span,
+        };
+        let (items, rest_line) = parse_items(rest_line, Some(&group))?;
+        let item = Item {
+            kind: ItemKind::Group(GROUP_KIND[index], items),
+            inline_span: line.span_to(&rest_line),
+        };
+        Ok((item, rest_line))
+    } else if let Some((term, span, rest_line)) = line.try_take_term() {
+        if term.starts_with(|c: char| c.is_numeric() || ['+', '-'].contains(&c)) {
+            (if term.contains('.') {
+                term.parse::<f64>()
+                    .map(|f| Item { kind: ItemKind::Num(Num::Float(f)), inline_span: span })
+                    .map_err(|error| line.item_error(span, ParseItemErrorKind::InvalidFloat(error)))
+            } else {
+                term.parse::<i64>()
+                    .map(|f| Item { kind: ItemKind::Num(Num::Int(f)), inline_span: span })
+                    .map_err(|error| line.item_error(span, ParseItemErrorKind::InvalidInt(error)))
+            }).map(|item| (item, rest_line))
+        } else {
+            let item = Item {
+                kind: ItemKind::Word(term.into()),
+                inline_span: span,
+            };
+            Ok((item, rest_line))
+        }
+    } else {
+        let (c, span, _) = line.take_char().expect("item parser only applied to non-empty inputs");
+        Err(line.item_error(span, ParseItemErrorKind::Unexpected(c)))
+    }
+}
+
+struct GroupContext {
+    end_marker: char,
+    begin_span: Span,
+}
+
+fn is_skipped_line(line: &str) -> bool {
+    let content = line.trim_start();
+    content.is_empty() || content.starts_with(COMMENT)
+}
+
+fn destruct_line<'l>(
+    mut line: &'l str,
+    location: &'l NodeLocation,
+) -> Result<(usize, Line<'l>), ParseError> {
+    let mut depth = 0;
+    while let Some(rest) = line.strip_prefix(INDENT) {
+        depth += 1;
+        line = rest;
+    }
+    if line.starts_with(char::is_whitespace) {
+        Err(ParseError {
+            kind: ParseErrorKind::InvalidIndentation,
+            location: location.clone(),
+        })
+    } else {
+        Ok((depth, Line {
+            content: line,
+            line_location: location,
+            item_span_start: depth * INDENT.len(),
+        }))
+    }
+}
+
+struct LineIter<'a> {
+    content: &'a str,
+    line_index: usize,
+    line_span_start: usize,
+}
+
+impl<'a> LineIter<'a> {
+    fn new(content: &'a str) -> Self {
+        LineIter {
+            content,
+            line_index: 0,
+            line_span_start: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for LineIter<'a> {
+    type Item = (&'a str, NodeLocation);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.content.is_empty() {
+            return None;
+        }
+        let (line_content_len, newline_len) = self.content.find('\n')
+            .map_or_else(|| (self.content.len(), 0), |index| (index, 1));
+        let full_line_len = line_content_len + newline_len;
+        let content = &self.content[..line_content_len];
+        let span = Span {
+            start: self.line_span_start,
+            len: line_content_len,
+        };
+        let location = NodeLocation {
+            line_index: self.line_index,
+            line_span: span,
+        };
+        self.content = &self.content[full_line_len..];
+        self.line_index += 1;
+        self.line_span_start += full_line_len;
+        Some((content, location))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Line<'a> {
+    content: &'a str,
+    line_location: &'a NodeLocation,
+    item_span_start: usize,
+}
+
+impl<'a> Line<'a> {
+    fn item_error(&self, span: Span, kind: ParseItemErrorKind) -> ParseError {
+        ParseError {
+            kind: ParseErrorKind::Item { span, kind },
+            location: self.line_location.clone(),
+        }
     }
 
-    fn propagate_from_depth(&mut self, depth: usize) {
-        while self.is_occupied_depth(depth) {
-            if let StackItem::Node(node) = self.node_stack.pop().unwrap() {
-                match self.node_stack.last_mut() {
-                    None => self.root.children_mut().push(node),
-                    Some(StackItem::Skip) => (),
-                    Some(StackItem::Node(parent)) => parent.children_mut().push(node),
-                }
+    fn span(&self, len: usize) -> Span {
+        Span {
+            start: self.item_span_start,
+            len,
+        }
+    }
+
+    fn span_to(&self, other: &Self) -> Span {
+        Span {
+            start: self.item_span_start,
+            len: other.item_span_start.checked_sub(self.item_span_start)
+                .expect("correct line input order for ranged span construction"),
+        }
+    }
+
+    fn skip(&self, len: usize) -> Self {
+        Self {
+            content: &self.content[len..],
+            line_location: self.line_location,
+            item_span_start: self.item_span_start + len,
+        }
+    }
+
+    fn try_take_term(&self) -> Option<(&'a str, Span, Self)> {
+        let rest = self.content.trim_start_matches(|c: char| {
+            !c.is_whitespace() && NON_TERM.iter().all(|chars| !chars.contains(&c))
+        });
+        let len = self.content.len() - rest.len();
+        if len > 0 {
+            Some((&self.content[..len], self.span(len), self.skip(len)))
+        } else {
+            None
+        }
+    }
+
+    fn take_char(&self) -> Option<(char, Span, Self)> {
+        self.content.chars().next().map(|c| {
+            let len = c.len_utf8();
+            (c, self.span(len), self.skip(len))
+        })
+    }
+
+    fn try_take_any_char(&self, chars: &[char]) -> Option<(char, Span, Self, usize)> {
+        let next = self.content.chars().next()?;
+        for (index, searched) in chars.iter().copied().enumerate() {
+            if searched == next {
+                let len = next.len_utf8();
+                return Some((next, self.span(len), self.skip(len), index));
             }
         }
+        None
+    }
+
+    fn trim(&self) -> Self {
+        let rest = self.content.trim_start();
+        let rest = if rest.starts_with(COMMENT) { "" } else { rest };
+        self.skip(self.content.len() - rest.len())
     }
 }
 
-enum StackItem<T> {
-    Node(T),
-    Skip,
+impl<'a> std::ops::Deref for Line<'a> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.content
+    }
 }
 
-impl<T> StackItem<T> {
-    fn map<U, F>(self, map_node: F) -> StackItem<U>
-    where
-        F: FnOnce(T) -> U,
-    {
-        match self {
-            Self::Node(node) => StackItem::Node(map_node(node)),
-            Self::Skip => StackItem::Skip,
+#[derive(Default)]
+struct TreeStack {
+    tree: Tree,
+    levels: Vec<Node>,
+}
+
+impl TreeStack {
+    fn insert_at_depth(&mut self, depth: usize, node: Node) -> Result<(), ParseError> {
+        self.vacate_depth(depth);
+        if self.levels.len() == depth {
+            self.levels.push(node);
+            Ok(())
+        } else {
+            Err(ParseError {
+                kind: ParseErrorKind::InvalidIndentationDepth,
+                location: node.location,
+            })
         }
     }
-}
 
-/// Details the kind of [`Error`] that occured during [`parse`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum ErrorKind<E> {
-    /// The item's [`FromInput`](crate::FromInput) implementation signalled an error.
-    Item {
-        error: E,
-        offset: usize,
-    },
-    /// The line contained additional whitespace that didn't fit the indentation setting.
-    IndentationInvalid,
-    /// The indentation level of the line is too high given it's logical parent.
-    IndentationTooDeep,
-}
-
-impl<E> ErrorKind<E> {
-    fn into_error(self, line_index: usize) -> Error<E> {
-        Error {
-            kind: self,
-            line_index,
-        }
+    fn into_tree(mut self) -> Tree {
+        self.vacate_depth(0);
+        self.tree
     }
-}
 
-/// Signals an error occurance during [`parse`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Error<E> {
-    pub kind: ErrorKind<E>,
-    pub line_index: usize,
-}
-
-impl<E> std::fmt::Display for Error<E>
-where
-    E: std::fmt::Display,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let line = self.line_index + 1;
-        match self.kind {
-            ErrorKind::Item { ref error, offset } => {
-                write!(f, "Unable to parse line {line}, byte offset {offset}: {error}")
-            },
-            ErrorKind::IndentationInvalid => {
-                write!(f, "Invalid indentation on line {line}")
-            },
-            ErrorKind::IndentationTooDeep => {
-                write!(f, "Indentation depth is too deep at line {line}")
-            },
+    fn vacate_depth(&mut self, depth: usize) {
+        while self.levels.len() > depth {
+            let lowest_node = self.levels.pop().unwrap();
+            self.levels.last_mut()
+                .map(|node| &mut node.subtree.nodes)
+                .unwrap_or(&mut self.tree.nodes)
+                .push(lowest_node);
         }
     }
 }
