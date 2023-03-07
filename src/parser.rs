@@ -1,11 +1,11 @@
-use std::num::{ParseIntError, ParseFloatError};
+use std::sync::Arc;
 
-use crate::{Tree, NodeLocation, Span, Item, ItemKind, GroupKind, Num, Node};
+use crate::display::display_fn;
+use crate::{Tree, NodeLocation, Span, Item, ItemKind, GroupKind, Node, NumError};
 
 
 const INDENT: &str = "  ";
 const COMMENT: char = ';';
-const PUNCT: [char; 3] = [':', '!', '?'];
 
 const GROUP_LEN: usize = 3;
 const GROUP_BEGIN: [char; GROUP_LEN] = ['(', '[', '{'];
@@ -18,63 +18,32 @@ const GROUP_KIND: [GroupKind; GROUP_LEN] = [
 
 const NON_TERM: &[&[char]] = &[
     &[COMMENT],
-    &PUNCT,
     &GROUP_BEGIN,
     &GROUP_END,
 ];
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ParseError {
-    pub kind: ParseErrorKind,
-    pub location: NodeLocation,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ParseErrorKind {
-    Item {
-        kind: ParseItemErrorKind,
-        span: Span,
-    },
-    InvalidIndentation,
-    InvalidIndentationDepth,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ParseItemErrorKind {
-    Unexpected(char),
-    InvalidInt(ParseIntError),
-    InvalidFloat(ParseFloatError),
-    MissingGroupClose(char),
-    UnexpectedGroupClose(char),
-    GroupCloseMismatch(char, Span),
-}
-
-pub(crate) fn parse_str(content: &str) -> Result<Tree, ParseError> {
+pub(crate) fn parse_str(content: &str, punctuation: &[char]) -> Result<Tree, ParseError> {
     let mut stack = TreeStack::default();
-    'lines: for (line, location) in LineIter::new(content) {
-        if is_skipped_line(line) {
+    'lines: for (full_line, location) in LineIter::new(content) {
+        if is_skipped_line(full_line) {
             continue 'lines;
         }
-        let (depth, line) = destruct_line(line, &location)?;
-        let items = parse_line(line)?;
-        let node = Node {
-            items,
-            location,
-            subtree: Tree::default(),
-        };
-        stack.insert_at_depth(depth, node)?;
+        let (depth, line_input) = LineInput::new(full_line, &location, punctuation)?;
+        let items = parse_line(line_input)?;
+        let node = Node::with_items(location, items);
+        stack.insert_at_depth(depth, node, full_line)?;
     }
     Ok(stack.into_tree())
 }
 
-fn parse_line(line: Line<'_>) -> Result<Vec<Item>, ParseError> {
+fn parse_line(line: LineInput<'_>) -> Result<Vec<Item>, ParseError> {
     parse_items(line, None).map(|(items, _)| items)
 }
 
 fn parse_items<'a>(
-    line: Line<'a>,
+    line: LineInput<'a>,
     group: Option<&GroupContext>,
-) -> Result<(Vec<Item>, Line<'a>), ParseError> {
+) -> Result<(Vec<Item>, LineInput<'a>), ParseError> {
     let mut items = Vec::new();
     let mut line = line.trim();
     while !line.is_empty() {
@@ -96,9 +65,9 @@ fn parse_items<'a>(
 }
 
 fn try_parse_group_end<'a>(
-    line: Line<'a>,
+    line: LineInput<'a>,
     group: Option<&GroupContext>,
-) -> Result<Option<Line<'a>>, ParseError> {
+) -> Result<Option<LineInput<'a>>, ParseError> {
     if let Some((c, span, rest_line, _)) = line.try_take_any_char(&GROUP_END) {
         if let Some(group) = group {
             if group.end_marker == c {
@@ -120,51 +89,27 @@ fn try_parse_group_end<'a>(
     }
 }
 
-fn parse_item<'a>(line: Line<'a>) -> Result<(Item, Line<'a>), ParseError> {
-    if let Some((c, span, rest_line, _)) = line.try_take_any_char(&PUNCT) {
-        let item = Item {
-            kind: ItemKind::Punctuation(c),
-            inline_span: span,
-        };
-        Ok((item, rest_line))
-    } else if let Some((_, span, rest_line, index)) = line.try_take_any_char(&GROUP_BEGIN) {
-        let group = GroupContext {
-            end_marker: GROUP_END[index],
-            begin_span: span,
-        };
+fn parse_item<'a>(line: LineInput<'a>) -> Result<(Item, LineInput<'a>), ParseError> {
+    if let Some((_, begin_span, rest_line, index)) = line.try_take_any_char(&GROUP_BEGIN) {
+        let group = GroupContext { end_marker: GROUP_END[index], begin_span };
         let (items, rest_line) = parse_items(rest_line, Some(&group))?;
-        let item = Item {
-            kind: ItemKind::Group(GROUP_KIND[index], items),
-            inline_span: line.span_to(&rest_line),
-        };
+        let item = ItemKind::Group(GROUP_KIND[index], items).at(line.span_to(&rest_line));
+        Ok((item, rest_line))
+    } else if let Some((c, span, rest_line, _)) = line.try_take_any_char(line.punctuation) {
+        let item = ItemKind::Punctuation(c).at(span);
         Ok((item, rest_line))
     } else if let Some((term, span, rest_line)) = line.try_take_term() {
         if term.starts_with(|c: char| c.is_numeric() || ['+', '-'].contains(&c)) {
-            (if term.contains('.') {
-                term.parse::<f64>()
-                    .map(|f| Item { kind: ItemKind::Num(Num::Float(f)), inline_span: span })
-                    .map_err(|error| line.item_error(span, ParseItemErrorKind::InvalidFloat(error)))
-            } else {
-                term.parse::<i64>()
-                    .map(|f| Item { kind: ItemKind::Num(Num::Int(f)), inline_span: span })
-                    .map_err(|error| line.item_error(span, ParseItemErrorKind::InvalidInt(error)))
-            }).map(|item| (item, rest_line))
+            term.parse()
+                .map(|n| (ItemKind::Num(n).at(span), rest_line))
+                .map_err(|error| line.item_error(span, ParseItemErrorKind::InvalidNum(error)))
         } else {
-            let item = Item {
-                kind: ItemKind::Word(term.into()),
-                inline_span: span,
-            };
+            let item = ItemKind::Word(term.into()).at(span);
             Ok((item, rest_line))
         }
     } else {
-        let (c, span, _) = line.take_char().expect("item parser only applied to non-empty inputs");
-        Err(line.item_error(span, ParseItemErrorKind::Unexpected(c)))
+        unreachable!("unexpected input char `{:?}`", line.content.chars().next())
     }
-}
-
-struct GroupContext {
-    end_marker: char,
-    begin_span: Span,
 }
 
 fn is_skipped_line(line: &str) -> bool {
@@ -172,27 +117,140 @@ fn is_skipped_line(line: &str) -> bool {
     content.is_empty() || content.starts_with(COMMENT)
 }
 
-fn destruct_line<'l>(
-    mut line: &'l str,
-    location: &'l NodeLocation,
-) -> Result<(usize, Line<'l>), ParseError> {
-    let mut depth = 0;
-    while let Some(rest) = line.strip_prefix(INDENT) {
-        depth += 1;
-        line = rest;
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub location: NodeLocation,
+    pub line_context: Arc<str>,
+}
+
+impl ParseError {
+    pub fn spans(&self) -> impl Iterator<Item = Span> + '_ {
+        match &self.kind {
+            ParseErrorKind::Item { kind, span } => match kind {
+                ParseItemErrorKind::InvalidNum(_) |
+                ParseItemErrorKind::MissingGroupClose(_) |
+                ParseItemErrorKind::UnexpectedGroupClose(_) => {
+                    SpanIter::Single(*span)
+                },
+                ParseItemErrorKind::GroupCloseMismatch(_, begin_span) => {
+                    SpanIter::from_multiple(*begin_span, *span)
+                },
+            },
+            ParseErrorKind::InvalidIndentation |
+            ParseErrorKind::InvalidIndentationDepth => {
+                SpanIter::Empty
+            },
+        }
     }
-    if line.starts_with(char::is_whitespace) {
-        Err(ParseError {
-            kind: ParseErrorKind::InvalidIndentation,
-            location: location.clone(),
+
+    pub fn fmt_message(&self) -> impl std::fmt::Display + '_ {
+        display_fn(|f| {
+            match &self.kind {
+                ParseErrorKind::Item { kind, .. } => match kind {
+                    ParseItemErrorKind::InvalidNum(num_error) => {
+                        write!(f, "Cannot parse numeric value because {num_error}")
+                    },
+                    ParseItemErrorKind::MissingGroupClose(c) => {
+                        write!(f, "Missing corresponding group close character `{c}`")
+                    },
+                    ParseItemErrorKind::UnexpectedGroupClose(c) => {
+                        write!(f, "Unexpected group close character `{c}`")
+                    },
+                    ParseItemErrorKind::GroupCloseMismatch(c, _) => {
+                        write!(f, "Wrong close character `{c}` for current group")
+                    },
+                },
+                ParseErrorKind::InvalidIndentation => {
+                    write!(f, "Indentation is not a multiple of 2")
+                },
+                ParseErrorKind::InvalidIndentationDepth => {
+                    write!(f, "Indentation is too deep for this level")
+                },
+            }
         })
-    } else {
-        Ok((depth, Line {
-            content: line,
-            line_location: location,
-            item_span_start: depth * INDENT.len(),
-        }))
     }
+
+    pub fn fmt_location(&self) -> impl std::fmt::Display + '_ {
+        display_fn(|f| {
+            let line_number = self.location.line_index + 1;
+            if let ParseErrorKind::Item { span, .. } = self.kind {
+                let byte_column = span.start;
+                write!(f, "line {line_number}, byte column {byte_column}")
+            } else {
+                write!(f, "line {line_number}")
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at {}", self.fmt_message(), self.fmt_location())
+    }
+}
+
+#[derive(Clone)]
+enum SpanIter {
+    Empty,
+    Single(Span),
+    Multiple(Span, Span),
+}
+
+impl SpanIter {
+    fn from_multiple(mut a: Span, mut b: Span) -> Self {
+        if a.start > b.start {
+            std::mem::swap(&mut a, &mut b);
+        }
+        if a.end() >= b.start {
+            let start = a.start;
+            let end = a.end().max(b.end());
+            Self::Single(Span { start, len: end - start })
+        } else {
+            Self::Multiple(a, b)
+        }
+    }
+}
+
+impl Iterator for SpanIter {
+    type Item = Span;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match *self {
+            Self::Empty => None,
+            Self::Single(span) => {
+                *self = Self::Empty;
+                Some(span)
+            },
+            Self::Multiple(span, left) => {
+                *self = Self::Single(left);
+                Some(span)
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseErrorKind {
+    Item {
+        kind: ParseItemErrorKind,
+        span: Span,
+    },
+    InvalidIndentation,
+    InvalidIndentationDepth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParseItemErrorKind {
+    InvalidNum(NumError),
+    MissingGroupClose(char),
+    UnexpectedGroupClose(char),
+    GroupCloseMismatch(char, Span),
+}
+
+struct GroupContext {
+    end_marker: char,
+    begin_span: Span,
 }
 
 struct LineIter<'a> {
@@ -238,17 +296,47 @@ impl<'a> Iterator for LineIter<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct Line<'a> {
+struct LineInput<'a> {
     content: &'a str,
+    punctuation: &'a [char],
     line_location: &'a NodeLocation,
+    line_context: &'a str,
     item_span_start: usize,
 }
 
-impl<'a> Line<'a> {
+impl<'a> LineInput<'a> {
+    fn new(
+        mut line: &'a str,
+        location: &'a NodeLocation,
+        punctuation: &'a [char],
+    ) -> Result<(usize, Self), ParseError> {
+        let mut depth = 0;
+        while let Some(rest) = line.strip_prefix(INDENT) {
+            depth += 1;
+            line = rest;
+        }
+        if line.starts_with(char::is_whitespace) {
+            Err(ParseError {
+                kind: ParseErrorKind::InvalidIndentation,
+                location: location.clone(),
+                line_context: line.into(),
+            })
+        } else {
+            Ok((depth, Self {
+                content: line,
+                line_location: location,
+                line_context: line,
+                item_span_start: depth * INDENT.len(),
+                punctuation,
+            }))
+        }
+    }
+
     fn item_error(&self, span: Span, kind: ParseItemErrorKind) -> ParseError {
         ParseError {
             kind: ParseErrorKind::Item { span, kind },
             location: self.line_location.clone(),
+            line_context: self.line_context.into(),
         }
     }
 
@@ -272,12 +360,16 @@ impl<'a> Line<'a> {
             content: &self.content[len..],
             line_location: self.line_location,
             item_span_start: self.item_span_start + len,
+            punctuation: self.punctuation,
+            line_context: self.line_context,
         }
     }
 
     fn try_take_term(&self) -> Option<(&'a str, Span, Self)> {
         let rest = self.content.trim_start_matches(|c: char| {
-            !c.is_whitespace() && NON_TERM.iter().all(|chars| !chars.contains(&c))
+            !c.is_whitespace()
+            && !self.punctuation.contains(&c)
+            && NON_TERM.iter().all(|nt_chars| !nt_chars.contains(&c))
         });
         let len = self.content.len() - rest.len();
         if len > 0 {
@@ -285,13 +377,6 @@ impl<'a> Line<'a> {
         } else {
             None
         }
-    }
-
-    fn take_char(&self) -> Option<(char, Span, Self)> {
-        self.content.chars().next().map(|c| {
-            let len = c.len_utf8();
-            (c, self.span(len), self.skip(len))
-        })
     }
 
     fn try_take_any_char(&self, chars: &[char]) -> Option<(char, Span, Self, usize)> {
@@ -312,7 +397,7 @@ impl<'a> Line<'a> {
     }
 }
 
-impl<'a> std::ops::Deref for Line<'a> {
+impl<'a> std::ops::Deref for LineInput<'a> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -327,7 +412,12 @@ struct TreeStack {
 }
 
 impl TreeStack {
-    fn insert_at_depth(&mut self, depth: usize, node: Node) -> Result<(), ParseError> {
+    fn insert_at_depth(
+        &mut self,
+        depth: usize,
+        node: Node,
+        line_context: &str,
+    ) -> Result<(), ParseError> {
         self.vacate_depth(depth);
         if self.levels.len() == depth {
             self.levels.push(node);
@@ -336,6 +426,7 @@ impl TreeStack {
             Err(ParseError {
                 kind: ParseErrorKind::InvalidIndentationDepth,
                 location: node.location,
+                line_context: line_context.into(),
             })
         }
     }
