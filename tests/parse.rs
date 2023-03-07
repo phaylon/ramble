@@ -1,6 +1,8 @@
 
 use assert_matches::assert_matches;
-use ramble::{Tree, ParseError, Span, GroupKind, ParseErrorKind, ParseItemErrorKind, NumError, NodeLocation};
+use ramble::{
+    Tree, ParseError, Span, GroupKind, ParseErrorKind, ParseItemErrorKind, NumError, NodeLocation,
+};
 
 
 fn deindent(content: &str) -> String {
