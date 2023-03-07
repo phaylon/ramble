@@ -1,4 +1,3 @@
-use std::sync::Arc;
 
 use crate::display::display_fn;
 use crate::{Tree, NodeLocation, Span, Item, ItemKind, GroupKind, Node, NumError};
@@ -31,7 +30,7 @@ pub(crate) fn parse_str(content: &str, punctuation: &[char]) -> Result<Tree, Par
         let (depth, line_input) = LineInput::new(full_line, &location, punctuation)?;
         let items = parse_line(line_input)?;
         let node = Node::with_items(location, items);
-        stack.insert_at_depth(depth, node, full_line)?;
+        stack.insert_at_depth(depth, node)?;
     }
     Ok(stack.into_tree())
 }
@@ -99,7 +98,7 @@ fn parse_item<'a>(line: LineInput<'a>) -> Result<(Item, LineInput<'a>), ParseErr
         let item = ItemKind::Punctuation(c).at(span);
         Ok((item, rest_line))
     } else if let Some((term, span, rest_line)) = line.try_take_term() {
-        if term.starts_with(|c: char| c.is_numeric() || ['+', '-'].contains(&c)) {
+        if term.starts_with(|c: char| c.is_numeric() || c == '-') {
             term.parse()
                 .map(|n| (ItemKind::Num(n).at(span), rest_line))
                 .map_err(|error| line.item_error(span, ParseItemErrorKind::InvalidNum(error)))
@@ -121,7 +120,6 @@ fn is_skipped_line(line: &str) -> bool {
 pub struct ParseError {
     pub kind: ParseErrorKind,
     pub location: NodeLocation,
-    pub line_context: Arc<str>,
 }
 
 impl ParseError {
@@ -300,7 +298,6 @@ struct LineInput<'a> {
     content: &'a str,
     punctuation: &'a [char],
     line_location: &'a NodeLocation,
-    line_context: &'a str,
     item_span_start: usize,
 }
 
@@ -319,13 +316,11 @@ impl<'a> LineInput<'a> {
             Err(ParseError {
                 kind: ParseErrorKind::InvalidIndentation,
                 location: location.clone(),
-                line_context: line.into(),
             })
         } else {
             Ok((depth, Self {
                 content: line,
                 line_location: location,
-                line_context: line,
                 item_span_start: depth * INDENT.len(),
                 punctuation,
             }))
@@ -336,7 +331,6 @@ impl<'a> LineInput<'a> {
         ParseError {
             kind: ParseErrorKind::Item { span, kind },
             location: self.line_location.clone(),
-            line_context: self.line_context.into(),
         }
     }
 
@@ -361,7 +355,6 @@ impl<'a> LineInput<'a> {
             line_location: self.line_location,
             item_span_start: self.item_span_start + len,
             punctuation: self.punctuation,
-            line_context: self.line_context,
         }
     }
 
@@ -416,7 +409,6 @@ impl TreeStack {
         &mut self,
         depth: usize,
         node: Node,
-        line_context: &str,
     ) -> Result<(), ParseError> {
         self.vacate_depth(depth);
         if self.levels.len() == depth {
@@ -426,7 +418,6 @@ impl TreeStack {
             Err(ParseError {
                 kind: ParseErrorKind::InvalidIndentationDepth,
                 location: node.location,
-                line_context: line_context.into(),
             })
         }
     }

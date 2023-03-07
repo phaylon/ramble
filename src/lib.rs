@@ -35,6 +35,15 @@ impl Tree {
     }
 }
 
+impl std::ops::Index<usize> for Tree {
+    type Output = Node;
+
+    #[track_caller]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.nodes[index]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
     pub items: Vec<Item>,
@@ -82,6 +91,28 @@ pub struct Item {
     pub inline_span: Span,
 }
 
+macro_rules! fn_item_variant {
+    ($name:ident -> $output:ty : $case:pat => $produce:expr) => {
+        pub fn $name(&self) -> Option<$output> {
+            if let $case = &self.kind {
+                Some($produce)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+impl Item {
+    fn_item_variant!(word -> &SmolStr: ItemKind::Word(word) => word);
+    fn_item_variant!(word_str -> &str: ItemKind::Word(word) => word);
+    fn_item_variant!(num -> Num: ItemKind::Num(num) => *num);
+    fn_item_variant!(int -> i64: ItemKind::Num(Num::Int(i)) => *i);
+    fn_item_variant!(float -> f64: ItemKind::Num(Num::Float(f)) => *f);
+    fn_item_variant!(punctuation -> char: ItemKind::Punctuation(c) => *c);
+    fn_item_variant!(group -> (GroupKind, &[Item]): ItemKind::Group(g, i) => (*g, i));
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ItemKind {
     Word(SmolStr),
@@ -96,7 +127,7 @@ impl ItemKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub enum Num {
     Int(i64),
     Float(f64),
